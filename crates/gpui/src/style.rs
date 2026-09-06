@@ -460,6 +460,9 @@ pub struct TextStyle {
     /// The font style, e.g. italic
     pub font_style: FontStyle,
 
+    /// Whether line baselines use this style's primary font metrics.
+    pub line_baseline_strut: bool,
+
     /// The background color of the text
     pub background_color: Option<Hsla>,
 
@@ -494,6 +497,7 @@ impl Default for TextStyle {
             line_height: phi(),
             font_weight: FontWeight::default(),
             font_style: FontStyle::default(),
+            line_baseline_strut: false,
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -548,6 +552,13 @@ impl TextStyle {
             weight: self.font_weight,
             style: self.font_style,
         }
+    }
+
+    /// Returns the configured line-baseline policy.
+    pub fn line_baseline(&self) -> crate::LineBaseline {
+        self.line_baseline_strut
+            .then(|| crate::LineBaseline::Strut(self.font()))
+            .unwrap_or_default()
     }
 
     /// Returns the rounded line height in pixels.

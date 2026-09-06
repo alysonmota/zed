@@ -1,4 +1,4 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{FontId, FontMetrics, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -578,6 +578,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
+        strut_font_id: Option<FontId>,
     ) -> Arc<WrappedLineLayout>
     where
         Text: AsRef<str>,
@@ -589,6 +590,7 @@ impl LineLayoutCache {
             runs,
             wrap_width,
             force_width: None,
+            strut_font_id,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -607,7 +609,8 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let unwrapped_layout =
+                self.layout_line::<&SharedString>(&text, font_size, runs, None, strut_font_id);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
             } else {
@@ -624,6 +627,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                strut_font_id,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -642,6 +646,7 @@ impl LineLayoutCache {
         font_size: Pixels,
         runs: &[FontRun],
         force_width: Option<Pixels>,
+        strut_font_id: Option<FontId>,
     ) -> Arc<LineLayout>
     where
         Text: AsRef<str>,
@@ -653,6 +658,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            strut_font_id,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -670,6 +676,11 @@ impl LineLayoutCache {
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
+            apply_strut_metrics(
+                &mut layout,
+                font_size,
+                strut_font_id.map(|font_id| self.platform_text_system.font_metrics(font_id)),
+            );
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -681,6 +692,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
+                strut_font_id,
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -704,6 +716,7 @@ impl LineLayoutCache {
         font_size: Pixels,
         runs: &[FontRun],
         force_width: Option<Pixels>,
+        strut_font_id: Option<FontId>,
     ) -> Option<Arc<LineLayout>> {
         let key_ref = HashedCacheKeyRef {
             text_hash,
@@ -712,6 +725,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            strut_font_id,
         };
 
         let current_frame = self.current_frame.read();
@@ -723,6 +737,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                strut_font_id: key.strut_font_id,
             } == key_ref
         }) {
             return Some(layout.clone());
@@ -737,6 +752,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                strut_font_id: key.strut_font_id,
             } == key_ref
         }) {
             return Some(layout.clone());
@@ -760,6 +776,7 @@ impl LineLayoutCache {
         font_size: Pixels,
         runs: &[FontRun],
         force_width: Option<Pixels>,
+        strut_font_id: Option<FontId>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
         let key_ref = HashedCacheKeyRef {
@@ -769,6 +786,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            strut_font_id,
         };
 
         // Fast path: already cached (no allocation).
@@ -781,6 +799,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                strut_font_id: key.strut_font_id,
             } == key_ref
         }) {
             return layout.clone();
@@ -802,6 +821,7 @@ impl LineLayoutCache {
                     runs: key.runs.as_slice(),
                     wrap_width: key.wrap_width,
                     force_width: key.force_width,
+                    strut_font_id: key.strut_font_id,
                 } == key_ref
             })
             .cloned()
@@ -819,6 +839,11 @@ impl LineLayoutCache {
         let mut layout = self
             .platform_text_system
             .layout_line(&text, font_size, runs);
+        apply_strut_metrics(
+            &mut layout,
+            font_size,
+            strut_font_id.map(|font_id| self.platform_text_system.font_metrics(font_id)),
+        );
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
@@ -831,6 +856,7 @@ impl LineLayoutCache {
             runs: SmallVec::from(runs),
             wrap_width: None,
             force_width,
+            strut_font_id,
         });
         let layout = Arc::new(layout);
         current_frame
@@ -871,6 +897,17 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     }
 }
 
+fn apply_strut_metrics(
+    layout: &mut LineLayout,
+    font_size: Pixels,
+    metrics: Option<FontMetrics>,
+) {
+    if let Some(metrics) = metrics {
+        layout.ascent = metrics.ascent(font_size);
+        layout.descent = metrics.descent(font_size);
+    }
+}
+
 /// A run of text with a single font.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[expect(missing_docs)]
@@ -890,6 +927,7 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    strut_font_id: Option<FontId>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -899,6 +937,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    strut_font_id: Option<FontId>,
 }
 
 #[derive(Clone, Debug)]
@@ -909,6 +948,7 @@ struct HashedCacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    strut_font_id: Option<FontId>,
 }
 
 #[derive(Copy, Clone)]
@@ -919,6 +959,7 @@ struct HashedCacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    strut_font_id: Option<FontId>,
 }
 
 impl PartialEq for dyn AsCacheKeyRef + '_ {
@@ -935,6 +976,7 @@ impl PartialEq for HashedCacheKey {
             && self.runs.as_slice() == other.runs.as_slice()
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
+            && self.strut_font_id == other.strut_font_id
     }
 }
 
@@ -948,6 +990,7 @@ impl Hash for HashedCacheKey {
         self.runs.as_slice().hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
+        self.strut_font_id.hash(state);
     }
 }
 
@@ -959,6 +1002,7 @@ impl PartialEq for HashedCacheKeyRef<'_> {
             && self.runs == other.runs
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
+            && self.strut_font_id == other.strut_font_id
     }
 }
 
@@ -972,6 +1016,7 @@ impl Hash for HashedCacheKeyRef<'_> {
         self.runs.hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
+        self.strut_font_id.hash(state);
     }
 }
 
@@ -991,6 +1036,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            strut_font_id: self.strut_font_id,
         }
     }
 }
@@ -1053,6 +1099,112 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    #[test]
+    fn strut_metrics_replace_content_metrics() {
+        let mut layout = make_layout(Vec::new());
+        let metrics = FontMetrics {
+            units_per_em: 1000,
+            ascent: 800.,
+            descent: 200.,
+            line_gap: 0.,
+            underline_position: 0.,
+            underline_thickness: 0.,
+            cap_height: 0.,
+            x_height: 0.,
+            bounding_box: Default::default(),
+        };
+
+        apply_strut_metrics(&mut layout, px(20.), Some(metrics));
+
+        assert_eq!(layout.ascent, px(16.));
+        assert_eq!(layout.descent, px(4.));
+    }
+
+    #[test]
+    fn content_metrics_remain_unchanged_without_a_strut() {
+        let mut layout = make_layout(Vec::new());
+
+        apply_strut_metrics(&mut layout, px(20.), None);
+
+        assert_eq!(layout.ascent, px(12.));
+        assert_eq!(layout.descent, px(4.));
+    }
+
+    #[test]
+    fn strut_keeps_baselines_stable_for_latin_and_cjk_runs() {
+        let line_height = px(24.);
+        let mut latin = make_layout(vec![glyph_at(0., 0)]);
+        let mut latin_and_cjk = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1)]);
+        latin_and_cjk.ascent = px(16.);
+        latin_and_cjk.descent = px(6.);
+
+        let baseline = |layout: &LineLayout| {
+            (line_height - layout.ascent - layout.descent) / 2. + layout.ascent
+        };
+
+        assert_ne!(baseline(&latin), baseline(&latin_and_cjk));
+
+        let primary_metrics = FontMetrics {
+            units_per_em: 1000,
+            ascent: 750.,
+            descent: 250.,
+            line_gap: 0.,
+            underline_position: 0.,
+            underline_thickness: 0.,
+            cap_height: 0.,
+            x_height: 0.,
+            bounding_box: Default::default(),
+        };
+        apply_strut_metrics(&mut latin, px(16.), Some(primary_metrics));
+        apply_strut_metrics(&mut latin_and_cjk, px(16.), Some(primary_metrics));
+
+        assert_eq!(baseline(&latin), baseline(&latin_and_cjk));
+    }
+
+    #[test]
+    fn cache_separates_layouts_with_different_struts() {
+        let cache = LineLayoutCache::new(Arc::new(crate::NoopTextSystem));
+        let runs = [FontRun {
+            len: 1,
+            font_id: FontId(0),
+        }];
+
+        let content = cache.layout_line("a", px(16.), &runs, None, None);
+        let strut = cache.layout_line("a", px(16.), &runs, None, Some(FontId(0)));
+        let repeated_strut = cache.layout_line("a", px(16.), &runs, None, Some(FontId(0)));
+
+        assert!(!Arc::ptr_eq(&content, &strut));
+        assert!(Arc::ptr_eq(&strut, &repeated_strut));
+    }
+
+    #[test]
+    fn hash_and_wrap_caches_include_the_strut() {
+        let cache = LineLayoutCache::new(Arc::new(crate::NoopTextSystem));
+        let runs = [FontRun {
+            len: 1,
+            font_id: FontId(0),
+        }];
+
+        let content = cache.layout_line_by_hash(1, 1, px(16.), &runs, None, None, || {
+            SharedString::new("a")
+        });
+        let strut = cache.layout_line_by_hash(1, 1, px(16.), &runs, None, Some(FontId(0)), || {
+            SharedString::new("a")
+        });
+        let wrapped_content = cache.layout_wrapped_line("a", px(16.), &runs, Some(px(8.)), None, None);
+        let wrapped_strut = cache.layout_wrapped_line(
+            "a",
+            px(16.),
+            &runs,
+            Some(px(8.)),
+            None,
+            Some(FontId(0)),
+        );
+
+        assert!(!Arc::ptr_eq(&content, &strut));
+        assert!(!Arc::ptr_eq(&wrapped_content, &wrapped_strut));
     }
 
     #[test]
