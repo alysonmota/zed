@@ -904,7 +904,8 @@ fn apply_strut_metrics(
 ) {
     if let Some(metrics) = metrics {
         layout.ascent = metrics.ascent(font_size);
-        layout.descent = metrics.descent(font_size);
+        // Platform font APIs disagree on descender sign, while layout needs a distance below baseline.
+        layout.descent = metrics.descent(font_size).abs();
     }
 }
 
@@ -1107,7 +1108,7 @@ mod tests {
         let metrics = FontMetrics {
             units_per_em: 1000,
             ascent: 800.,
-            descent: 200.,
+            descent: -200.,
             line_gap: 0.,
             underline_position: 0.,
             underline_thickness: 0.,
