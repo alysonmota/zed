@@ -349,6 +349,17 @@ impl ListState {
         self
     }
 
+    /// Pre-populate every unmeasured item with a height estimate based on its index.
+    ///
+    /// As items are actually rendered their real heights replace the estimate, so the
+    /// scrollbar and programmatic scroll positions converge to the exact layout over time.
+    /// This is useful for variable-height lists whose item content can provide a better
+    /// estimate than a single uniform height.
+    pub fn with_item_height_estimator(self, estimate_height: impl FnMut(usize) -> Pixels) -> Self {
+        self.apply_item_height_estimator(estimate_height);
+        self
+    }
+
     /// Reset this instantiation of the list state.
     ///
     /// Note that this will cause scroll events to be dropped until the next paint.
@@ -374,6 +385,17 @@ impl ListState {
         self.apply_uniform_item_height(height);
     }
 
+    /// Reset the list to `element_count` items, pre-populating every item with a height
+    /// estimate based on its index.
+    pub fn reset_with_item_height_estimator(
+        &self,
+        element_count: usize,
+        estimate_height: impl FnMut(usize) -> Pixels,
+    ) {
+        self.reset(element_count);
+        self.apply_item_height_estimator(estimate_height);
+    }
+
     fn apply_uniform_item_height(&self, height: Pixels) {
         let size_hint = Size {
             width: px(0.),
@@ -385,6 +407,25 @@ impl ListState {
             .iter()
             .map(|item| ListItem::Unmeasured {
                 size_hint: Some(item.size_hint().unwrap_or(size_hint)),
+                focus_handle: item.focus_handle(),
+            })
+            .collect::<Vec<_>>();
+        let mut tree = SumTree::default();
+        tree.extend(new_items, ());
+        state.items = tree;
+    }
+
+    fn apply_item_height_estimator(&self, mut estimate_height: impl FnMut(usize) -> Pixels) {
+        let mut state = self.0.borrow_mut();
+        let new_items = state
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| ListItem::Unmeasured {
+                size_hint: Some(item.size_hint().unwrap_or(Size {
+                    width: px(0.),
+                    height: estimate_height(index),
+                })),
                 focus_handle: item.focus_handle(),
             })
             .collect::<Vec<_>>();
@@ -1728,6 +1769,31 @@ mod test {
         IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
         px, size,
     };
+
+    #[test]
+    fn item_height_estimator_seeds_each_item() {
+        let state = ListState::new(3, crate::ListAlignment::Top, px(0.))
+            .with_item_height_estimator(|index| px((index as f32 + 1.) * 20.));
+
+        let state = state.0.borrow();
+        let summary = state.items.summary();
+        assert_eq!(summary.height, px(120.));
+        assert!(!summary.has_unknown_height);
+    }
+
+    #[test]
+    fn reset_with_item_height_estimator_replaces_all_hints() {
+        let state = ListState::new(3, crate::ListAlignment::Top, px(0.))
+            .with_item_height_estimator(|_| px(20.));
+
+        state.reset_with_item_height_estimator(2, |index| px((index as f32 + 1.) * 30.));
+
+        let state = state.0.borrow();
+        let summary = state.items.summary();
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.height, px(90.));
+        assert!(!summary.has_unknown_height);
+    }
 
     #[gpui::test]
     fn test_autoscroll_above_item_top_renders_items_above(cx: &mut TestAppContext) {
