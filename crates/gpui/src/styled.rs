@@ -716,6 +716,12 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Forces descendant text lines to use their primary font metrics.
+    fn line_baseline_strut(mut self) -> Self {
+        self.text_style().line_baseline_strut = Some(true);
+        self
+    }
+
     /// Sets the font of this element and its children.
     fn font(mut self, font: Font) -> Self {
         let Font {

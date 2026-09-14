@@ -37,6 +37,19 @@ use std::{
 #[repr(C)]
 pub struct FontId(pub usize);
 
+/// Controls which font metrics anchor a line's baseline and text decorations.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum LineBaseline {
+    /// Use aggregate metrics from the shaped text content.
+    #[default]
+    Content,
+    /// Force line metrics to this font instead of using the shaped content metrics.
+    ///
+    /// This stabilizes the baseline when fallback runs change. It does not reserve
+    /// additional space for glyphs whose metrics exceed the declared font.
+    Strut(Font),
+}
+
 /// An opaque identifier for a specific font family.
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct FontFamilyId(pub usize);
@@ -413,6 +426,18 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> ShapedLine {
+        self.shape_line_with_baseline(text, font_size, runs, force_width, LineBaseline::Content)
+    }
+
+    /// Shape a line using an explicit baseline policy.
+    pub fn shape_line_with_baseline(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        force_width: Option<Pixels>,
+        baseline: LineBaseline,
+    ) -> ShapedLine {
         debug_assert!(
             text.find('\n').is_none(),
             "text argument should not contain newlines"
@@ -438,7 +463,7 @@ impl WindowTextSystem {
             });
         }
 
-        let layout = self.layout_line(&text, font_size, runs, force_width);
+        let layout = self.layout_line_with_baseline(&text, font_size, runs, force_width, baseline);
 
         ShapedLine {
             layout,
@@ -466,6 +491,28 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> ShapedLine {
+        self.shape_line_by_hash_with_baseline(
+            text_hash,
+            text_len,
+            font_size,
+            runs,
+            force_width,
+            LineBaseline::Content,
+            materialize_text,
+        )
+    }
+
+    /// Shape a line using a content hash and an explicit baseline policy.
+    pub fn shape_line_by_hash_with_baseline(
+        &self,
+        text_hash: u64,
+        text_len: usize,
+        font_size: Pixels,
+        runs: &[TextRun],
+        force_width: Option<Pixels>,
+        baseline: LineBaseline,
+        materialize_text: impl FnOnce() -> SharedString,
+    ) -> ShapedLine {
         let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
         for run in runs {
             if let Some(last_run) = decoration_runs.last_mut()
@@ -486,13 +533,13 @@ impl WindowTextSystem {
             });
         }
 
-        let mut used_force_width = force_width;
-        let layout = self.layout_line_by_hash(
+        let layout = self.layout_line_by_hash_with_baseline(
             text_hash,
             text_len,
             font_size,
             runs,
-            used_force_width,
+            force_width,
+            baseline,
             || {
                 let text = materialize_text();
                 debug_assert!(
@@ -526,8 +573,29 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with_baseline(
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+            LineBaseline::Content,
+        )
+    }
+
+    /// Shape text using an explicit baseline policy.
+    pub fn shape_text_with_baseline(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+        baseline: LineBaseline,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        let strut_font_id = self.resolve_line_baseline(baseline);
 
         let mut lines = SmallVec::new();
         let mut max_wrap_lines = line_clamp;
@@ -592,6 +660,7 @@ impl WindowTextSystem {
                 &font_runs,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
+                strut_font_id,
             );
             wrapped_lines += layout.wrap_boundaries.len();
 
@@ -661,6 +730,18 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
+        self.layout_line_with_baseline(text, font_size, runs, force_width, LineBaseline::Content)
+    }
+
+    /// Layout a line using an explicit baseline policy.
+    pub fn layout_line_with_baseline(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[TextRun],
+        force_width: Option<Pixels>,
+        baseline: LineBaseline,
+    ) -> Arc<LineLayout> {
         let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         font_runs.clear();
@@ -698,6 +779,7 @@ impl WindowTextSystem {
             font_size,
             &font_runs,
             force_width,
+            self.resolve_line_baseline(baseline),
         );
 
         self.font_runs_pool.lock().push(font_runs);
@@ -717,6 +799,7 @@ impl WindowTextSystem {
                     len: buffer.len(),
                     font_id,
                 }],
+                None,
                 None,
             )
             .width
@@ -742,6 +825,26 @@ impl WindowTextSystem {
         font_size: Pixels,
         runs: &[TextRun],
         force_width: Option<Pixels>,
+    ) -> Option<Arc<LineLayout>> {
+        self.try_layout_line_by_hash_with_baseline(
+            text_hash,
+            text_len,
+            font_size,
+            runs,
+            force_width,
+            LineBaseline::Content,
+        )
+    }
+
+    /// Probe a hashed line layout using an explicit baseline policy.
+    pub fn try_layout_line_by_hash_with_baseline(
+        &self,
+        text_hash: u64,
+        text_len: usize,
+        font_size: Pixels,
+        runs: &[TextRun],
+        force_width: Option<Pixels>,
+        baseline: LineBaseline,
     ) -> Option<Arc<LineLayout>> {
         let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
@@ -781,6 +884,7 @@ impl WindowTextSystem {
             font_size,
             &font_runs,
             force_width,
+            self.resolve_line_baseline(baseline),
         );
 
         self.font_runs_pool.lock().push(font_runs);
@@ -803,6 +907,28 @@ impl WindowTextSystem {
         font_size: Pixels,
         runs: &[TextRun],
         force_width: Option<Pixels>,
+        materialize_text: impl FnOnce() -> SharedString,
+    ) -> Arc<LineLayout> {
+        self.layout_line_by_hash_with_baseline(
+            text_hash,
+            text_len,
+            font_size,
+            runs,
+            force_width,
+            LineBaseline::Content,
+            materialize_text,
+        )
+    }
+
+    /// Layout a hashed line using an explicit baseline policy.
+    pub fn layout_line_by_hash_with_baseline(
+        &self,
+        text_hash: u64,
+        text_len: usize,
+        font_size: Pixels,
+        runs: &[TextRun],
+        force_width: Option<Pixels>,
+        baseline: LineBaseline,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
         let mut last_run = None::<&TextRun>;
@@ -843,12 +969,20 @@ impl WindowTextSystem {
             font_size,
             &font_runs,
             force_width,
+            self.resolve_line_baseline(baseline),
             materialize_text,
         );
 
         self.font_runs_pool.lock().push(font_runs);
 
         layout
+    }
+
+    fn resolve_line_baseline(&self, baseline: LineBaseline) -> Option<FontId> {
+        match baseline {
+            LineBaseline::Content => None,
+            LineBaseline::Strut(font) => Some(self.resolve_font(&font)),
+        }
     }
 }
 
